@@ -1,0 +1,580 @@
+const NOME_ABA_PRODUTOS = 'Produtos';
+const NOME_ABA_VENDAS = 'Vendas';
+const NOME_ABA_DASHBOARD = 'Dashboard';
+const LIMITE_ESTOQUE_BAIXO = 10;
+const FORMAS_PAGAMENTO = ['Dinheiro', 'PIX', 'Cartão de Crédito', 'Cartão de Débito'];
+
+
+const PAYLOAD_BASE = "Por favor, coloque aqui seu payload PIX com a sua conta bancária.";
+
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('Vendas')
+    .addItem('Adicionar Venda', 'mostrarDialogoVenda')
+    .addSeparator()
+    .addItem('Abrir QR Code Selecionado', 'abrirQrCodeDaSelecao')
+    .addSeparator()
+    .addItem('Rodar Setup (validação + alerta + gráficos)', 'setupPlanilha')
+    .addToUi();
+}
+
+function onEdit(e) {
+  if (!e) return;
+  const sh = e.range.getSheet();
+  if (sh.getName() === NOME_ABA_PRODUTOS) {
+    aplicarBordasProdutos();
+  } else if (sh.getName() === NOME_ABA_VENDAS) {
+    aplicarBordasVendas();
+    atualizarDashboard();
+  }
+}
+
+
+function mostrarDialogoVenda() {
+  const html = HtmlService.createHtmlOutput(
+    `<div style="font-family:Arial,sans-serif;padding:12px;max-width:360px">
+        <h2 style="margin:0 0 12px">Adicionar Venda</h2>
+        <label>Produto</label>
+        <select id="produto" style="width:100%;margin:6px 0 12px"></select>
+        <label>Modelo</label>
+        <select id="modelo" style="width:100%;margin:6px 0 12px">
+          <option value="">— selecione produto primeiro —</option>
+        </select>
+        <label>Tamanho</label>
+        <select id="tamanho" style="width:100%;margin:6px 0 12px">
+          <option value="">— selecione produto primeiro —</option>
+        </select>
+        <label>Quantidade</label>
+        <input id="quantidade" type="number" min="1" value="1" style="width:100%;margin:6px 0 12px" />
+        <label>Desconto (R$)</label>
+        <input id="desconto" type="number" min="0" value="0" step="0.01" style="width:100%;margin:6px 0 12px" />
+        <label>Data</label>
+        <input id="data" type="date" style="width:100%;margin:6px 0 12px" />
+        <label>Forma de Pagamento</label>
+        <select id="formaPagamento" style="width:100%;margin:6px 0 12px">
+          ${FORMAS_PAGAMENTO.map(f => `<option value="${f}">${f}</option>`).join('')}
+        </select>
+
+        <button onclick="salvar()" style="width:100%;padding:8px">Lançar</button>
+
+        <script>
+          google.script.run.withSuccessHandler(function(dataFormatada){
+            document.getElementById('data').value = dataFormatada;
+          }).getDataAtualFormatada();
+
+
+          google.script.run.withSuccessHandler(function(lista){
+            const sel = document.getElementById('produto');
+            sel.innerHTML = '<option value="">— selecione —</option>';
+            lista.forEach(p => {
+              const opt = document.createElement('option');
+              opt.value=p; opt.text=p; sel.appendChild(opt);
+            });
+          }).getListaProdutos();
+
+          document.addEventListener('change', function(e){
+            if(e.target && e.target.id === 'produto'){
+              const produto = e.target.value;
+              const selModelo = document.getElementById('modelo');
+              const selTam = document.getElementById('tamanho');
+              selModelo.innerHTML = '<option value="">Carregando...</option>';
+              selTam.innerHTML   = '<option value="">Carregando...</option>';
+              if(!produto){
+                selModelo.innerHTML = '<option value="">— selecione produto primeiro —</option>';
+                selTam.innerHTML   = '<option value="">— selecione produto primeiro —</option>';
+                return;
+              }
+              google.script.run.withSuccessHandler(function(listaModelo){
+                selModelo.innerHTML = '<option value="">— selecione —</option>';
+                listaModelo.forEach(m => {
+                  const opt = document.createElement('option');
+                  opt.value=m; opt.text=m; selModelo.appendChild(opt);
+                });
+              }).getModelos(produto);
+
+              google.script.run.withSuccessHandler(function(listaTam){
+                selTam.innerHTML = '<option value="">— selecione —</option>';
+                listaTam.forEach(t => {
+                  const opt = document.createElement('option');
+                  opt.value=t; opt.text=t; selTam.appendChild(opt);
+                });
+              }).getTamanhos(produto);
+            }
+          });
+
+          window.salvar = function(){
+            const produto = document.getElementById('produto').value;
+            const modelo  = document.getElementById('modelo').value;
+            const tamanho = document.getElementById('tamanho').value;
+            const qtd     = Number(document.getElementById('quantidade').value || 0);
+            const desconto= Number(document.getElementById('desconto').value || 0);
+            const data    = document.getElementById('data').value;
+            const formaPagamento = document.getElementById('formaPagamento').value;
+            if(!produto || !modelo || !tamanho || qtd <= 0){
+              alert('Preencha produto, modelo, tamanho e quantidade válida.');
+              return;
+            }
+            google.script.run.withSuccessHandler(function(){
+              google.script.host.close();
+            }).adicionarVenda({
+              produto: produto,
+              modelo: modelo,
+              tamanho: tamanho,
+              quantidade: qtd,
+              desconto: desconto,
+              data: data,
+              formaPagamento: formaPagamento
+            });
+          }
+        </script>
+      </div>`
+  ).setWidth(400).setHeight(450); // Altura ajustada
+
+  SpreadsheetApp.getUi().showModalDialog(html, "Adicionar Venda");
+}
+
+function abrirQrCodeDaSelecao() {
+  const range = SpreadsheetApp.getActiveRange();
+  if (!range) return;
+  const sheet = range.getSheet();
+  const ui = SpreadsheetApp.getUi();
+
+  if (sheet.getName() === NOME_ABA_VENDAS && range.getColumn() === 11 && range.getRow() >= 2) {
+    const linha = range.getRow();
+    // Tenta obter a fórmula da célula K (índice 11)
+    const formulaRange = sheet.getRange(linha, 11);
+    const formula = formulaRange.getFormula();
+    if (formula.includes("=IMAGE(")) {
+      mostrarQrCodePopup(linha);
+    } else {
+      ui.alert("Selecione o QR Code (Col. K) de uma linha de PIX.");
+    }
+  } else {
+    ui.alert("Por favor, selecione o QR Code (Col. K) de uma linha de PIX na aba Vendas.");
+  }
+}
+
+function mostrarQrCodePopup(linha) {
+  const sh = SpreadsheetApp.getActive().getSheetByName(NOME_ABA_VENDAS);
+  if (!sh) return;
+  const ui = SpreadsheetApp.getUi();
+
+  const formula = sh.getRange(linha, 11).getFormula();
+  const match = formula.match(/=IMAGE\("([^"]+)"/i);
+  if (match && match[1]) {
+    let qrCodeUrl = match[1];
+    qrCodeUrl = qrCodeUrl.replace('size=60x60', 'size=300x300');
+    const html = HtmlService.createHtmlOutput(
+      `<div style="text-align:center; padding: 20px;">
+          <h3 style="margin-top:0;">QR Code PIX</h3>
+          <img src="${qrCodeUrl}" width="300" height="300" />
+          <p style="margin-top:20px;"><button onclick="google.script.host.close()" style="padding: 10px 20px;">Fechar</button></p>
+        </div>`
+    ).setWidth(350).setHeight(475);
+
+    ui.showModalDialog(html, 'QR Code da Venda');
+  }
+}
+
+function adicionarVenda({ produto, modelo, tamanho, quantidade, desconto, data, formaPagamento }) {
+  const ss = SpreadsheetApp.getActive();
+  const shVendas = ss.getSheetByName(NOME_ABA_VENDAS);
+  if (!shVendas) throw new Error('Aba "Vendas" não encontrada.');
+
+  let lastRow = shVendas.getLastRow();
+  for (let i = lastRow; i >= 2; i--) {
+    const valor = shVendas.getRange(i, 1).getValue();
+    if (String(valor).toUpperCase() === 'TOTAL') {
+      shVendas.deleteRow(i);
+    }
+  }
+
+  const linha = shVendas.getLastRow() + 1;
+  const precoVenda = getPrecoVenda(produto, modelo, tamanho);
+  const dataLanc = parseDate(data);
+  if (precoVenda === 0) {
+    throw new Error('Preço não encontrado para o produto: ' + produto + ' ' + modelo + ' ' + tamanho);
+  }
+  const valorTotal = (precoVenda * quantidade) - desconto;
+
+  if (formaPagamento === 'PIX') {
+    const qrCodeUrl = gerarPayloadPix(valorTotal);
+    if (qrCodeUrl) {
+      const qrCodeFormula = `=IMAGE("${qrCodeUrl}"; 1)`;
+      shVendas.getRange(linha, 11).setFormula(qrCodeFormula);
+      shVendas.setRowHeight(linha, 65); // Ajusta a altura da linha para o QR Code
+
+      shVendas.getRange(linha, 12).setValue("");
+    }
+  }
+
+  shVendas.getRange(linha, 1).setValue(dataLanc);
+  shVendas.getRange(linha, 2).setValue(produto);
+  shVendas.getRange(linha, 3).setValue(modelo);
+  shVendas.getRange(linha, 4).setValue(tamanho);
+  shVendas.getRange(linha, 5).setValue(quantidade);
+  shVendas.getRange(linha, 6).setNumberFormat('R$ #,##0.00').setValue(precoVenda);
+  shVendas.getRange(linha, 7).setNumberFormat('R$ #,##0.00').setValue(desconto);
+  shVendas.getRange(linha, 8).setNumberFormat('R$ #,##0.00').setValue(valorTotal);
+  shVendas.getRange(linha, 9).setValue(formaPagamento);
+  shVendas.getRange(linha, 10).setValue("Não Pago");
+
+  if (formaPagamento !== 'PIX') {
+    shVendas.getRange(linha, 11).setValue("");
+    shVendas.getRange(linha, 12).setValue("");
+  }
+
+  shVendas.getRange(linha, 1, 1, 11).setBorder(true, true, true, true, true, true);
+
+  aplicarBordasVendas();
+  recomputeEstoqueAll();
+  atualizarDashboard();
+
+  const novaLinhaTotal = shVendas.getLastRow() + 1;
+  shVendas.getRange(novaLinhaTotal, 1).setValue('TOTAL').setFontWeight('bold').setBackground('#f2f2f2');
+  shVendas.getRange(novaLinhaTotal, 8)
+    .setFormula(`=SUM(H2:H${novaLinhaTotal - 1})`)
+    .setNumberFormat('R$ #,##0.00')
+    .setFontWeight('bold')
+    .setBackground('#f2f2f2');
+  // ALTERADO: Aplica bordas e cor de fundo até a coluna K (11)
+  shVendas.getRange(novaLinhaTotal, 1, 1, 11).setBorder(true, true, true, true, true, true);
+}
+
+function getListaProdutos() {
+  const sh = SpreadsheetApp.getActive().getSheetByName(NOME_ABA_PRODUTOS);
+  if (!sh) return [];
+  const arr = sh.getRange('B2:B' + sh.getLastRow()).getValues().flat().filter(String);
+  return Array.from(new Set(arr));
+}
+
+function getModelos(produto) {
+  const sh = SpreadsheetApp.getActive().getSheetByName(NOME_ABA_PRODUTOS);
+  if (!sh || !produto) return [];
+  const linhas = sh.getRange('B2:C' + sh.getLastRow()).getValues();
+  const modelos = [];
+  for (let i = 0; i < linhas.length; i++) {
+    if (linhas[i][0] === produto && String(linhas[i][1]).trim() !== '')
+      modelos.push(String(linhas[i][1]).trim());
+  }
+  return Array.from(new Set(modelos));
+}
+
+function getTamanhos(produto) {
+  const sh = SpreadsheetApp.getActive().getSheetByName(NOME_ABA_PRODUTOS);
+  if (!sh || !produto) return [];
+  const linhas = sh.getRange('B2:D' + sh.getLastRow()).getValues();
+  const tamanhos = [];
+  for (let i = 0; i < linhas.length; i++) {
+    if (linhas[i][0] === produto && String(linhas[i][2]).trim() !== '')
+      tamanhos.push(String(linhas[i][2]).trim());
+  }
+  return Array.from(new Set(tamanhos));
+}
+
+function getPrecoVenda(produto, modelo, tamanho) {
+  const sh = SpreadsheetApp.getActive().getSheetByName(NOME_ABA_PRODUTOS);
+  if (!sh) return 0;
+
+  const dados = sh.getRange('B2:H' + sh.getLastRow()).getValues();
+
+  for (let i = 0; i < dados.length; i++) {
+    const produtoAtual = String(dados[i][0]).trim();
+    const modeloAtual = String(dados[i][1]).trim();
+    const tamanhoAtual = String(dados[i][2]).trim();
+
+    if (produtoAtual === produto &&
+      modeloAtual === modelo &&
+      tamanhoAtual === tamanho) {
+      // Coluna F = índice 4 (preço de venda)
+      const preco = parseFloat(dados[i][4]) || 0;
+      return preco;
+    }
+  }
+  return 0;
+}
+
+function recomputeEstoqueAll() {
+  const ss = SpreadsheetApp.getActive();
+  const shProdutos = ss.getSheetByName(NOME_ABA_PRODUTOS);
+  const shVendas = ss.getSheetByName(NOME_ABA_VENDAS);
+  if (!shProdutos) return;
+  const lastProd = shProdutos.getLastRow();
+  if (lastProd < 2) return;
+
+  const produtos = shProdutos.getRange('B2:H' + lastProd).getValues();
+  let vendas = [];
+  if (shVendas && shVendas.getLastRow() >= 2) {
+    const lastV = shVendas.getLastRow();
+    vendas = shVendas.getRange('B2:E' + lastV).getValues();
+  }
+
+  const map = {};
+  for (let i = 0; i < vendas.length; i++) {
+    const key = String(vendas[i][0]) + String(vendas[i][1]) + String(vendas[i][2]);
+    const qtd = Number(vendas[i][3]) || 0;
+    map[key] = (map[key] || 0) + qtd;
+  }
+
+  const updates = [];
+  for (let i = 0; i < produtos.length; i++) {
+    const key = String(produtos[i][0]) + String(produtos[i][1]) + String(produtos[i][2]);
+    const estoqueInicial = Number(produtos[i][5]) || 0;
+    const sold = map[key] || 0;
+    updates.push([estoqueInicial - sold]);
+  }
+  shProdutos.getRange(2, 8, updates.length, 1).setValues(updates);
+}
+
+function getDataAtualFormatada() {
+  const fusoHorario = SpreadsheetApp.getActive().getSpreadsheetTimeZone();
+  // Retorna no formato YYYY-MM-DD para preencher corretamente o input 'date' do HTML
+  return Utilities.formatDate(new Date(), fusoHorario, "yyyy-MM-dd");
+}
+
+function parseDate(dateStr) {
+  if (!dateStr) return new Date();
+  const parts = dateStr.split('-');
+  return new Date(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2]));
+}
+
+function formatarPrecoProdutos() {
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName(NOME_ABA_PRODUTOS);
+  if (!sh) return;
+
+  const ultimaLinha = Math.max(sh.getLastRow(), 1000);
+  sh.getRange('E2:E' + ultimaLinha).setNumberFormat('R$ #,##0.00'); // Preço custo
+  sh.getRange('F2:F' + ultimaLinha).setNumberFormat('R$ #,##0.00'); // Preço venda
+  sh.getRange('G2:G' + ultimaLinha).setNumberFormat('0');// Estoque inicial
+}
+
+function aplicarBordasProdutos() {
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName(NOME_ABA_PRODUTOS);
+  if (!sh) return;
+  const lastRow = sh.getLastRow();
+  const lastCol = sh.getLastColumn();
+  if (lastRow < 2 || lastCol < 1) return;
+  sh.getRange(2, 1, lastRow - 1, lastCol).setBorder(true, true, true, true, true, true);
+}
+
+function aplicarBordasVendas() {
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName(NOME_ABA_VENDAS);
+  if (!sh) return;
+  const lastRow = sh.getLastRow();
+  // Colunas de A (1) até K (11)
+  if (lastRow >= 2) {
+    sh.getRange(2, 1, lastRow - 1, 11).setBorder(true, true, true, true, true, true);
+  }
+}
+
+
+function gerarPayloadPix(valor) {
+  const valorFormatado = valor.toFixed(2);
+  const valorPix = valorFormatado;
+
+  const valorLength = valorPix.length;
+  const valorPixLengthString = String(valorLength).padStart(2, '0');
+  const regexValor = /54[0-9]{2}[0-9\.]+/; // Tenta encontrar o 54 e seu valor
+  const novoValor = `54${valorPixLengthString}${valorPix}`;
+
+  let payloadComValor = PAYLOAD_BASE.replace(regexValor, novoValor);
+
+  if (payloadComValor === PAYLOAD_BASE) {
+  }
+
+  const payloadFinal = payloadComValor;
+
+  return "https://api.qrserver.com/v1/create-qr-code/?data="
+    + encodeURIComponent(payloadFinal)
+    + "&size=60x60";
+}
+
+function atualizarDashboard() {
+  const ss = SpreadsheetApp.getActive();
+  const vendasSheet = ss.getSheetByName(NOME_ABA_VENDAS);
+  const produtosSheet = ss.getSheetByName(NOME_ABA_PRODUTOS);
+  let dash = ss.getSheetByName(NOME_ABA_DASHBOARD);
+  if (!dash) dash = ss.insertSheet(NOME_ABA_DASHBOARD);
+
+  dash.clear();
+  dash.getRange('A1').setValue('Dashboard - Vendas do Mês').setFontWeight('bold').setFontSize(14);
+
+  const hoje = new Date();
+  const mesAtual = hoje.getMonth();
+  const anoAtual = hoje.getFullYear();
+
+  const vendas = vendasSheet.getDataRange().getValues();
+  const produtos = produtosSheet.getDataRange().getValues();
+
+  const headerVendas = vendas[0];
+  const idxFormaPgto = headerVendas.indexOf("Forma de Pagamento");
+  const idxValorTotal = headerVendas.indexOf("Valor Total");
+
+  const vendasPorDia = {};
+  const formaPagamentoMes = {
+    "PIX": 0,
+    "Dinheiro": 0,
+    "Cartão de Crédito": 0,
+    "Cartão de Débito": 0
+  };
+
+  const mapaCusto = {};
+  for (let i = 1; i < produtos.length; i++) {
+    const nomeProduto = produtos[i][1];
+    const precoCusto = produtos[i][4];
+    if (nomeProduto && precoCusto) mapaCusto[nomeProduto] = Number(precoCusto);
+  }
+
+  let totalCusto = 0;
+  let totalVenda = 0;
+
+  for (let i = 1; i < vendas.length; i++) {
+    const linha = vendas[i];
+    const dataVenda = linha[0];
+    const produto = linha[1];
+    const quantidade = Number(linha[4]);
+    const valorTotal = Number(linha[idxValorTotal]);
+    const forma = linha[idxFormaPgto];
+
+    if (dataVenda && valorTotal) {
+      const dataObj = new Date(dataVenda);
+      if (dataObj.getMonth() === mesAtual && dataObj.getFullYear() === anoAtual) {
+
+        const key = Utilities.formatDate(dataObj, Session.getScriptTimeZone(), "dd/MM/yyyy");
+        vendasPorDia[key] = (vendasPorDia[key] || 0) + valorTotal;
+
+        if (formaPagamentoMes.hasOwnProperty(forma)) {
+          formaPagamentoMes[forma] += valorTotal;
+        }
+      }
+    }
+
+    if (produto && quantidade) {
+      const custoProduto = mapaCusto[produto] || 0;
+      totalCusto += custoProduto * quantidade;
+    }
+  }
+
+  totalVenda = Object.values(vendasPorDia).reduce((sum, val) => sum + val, 0);
+
+
+  const dias = Object.keys(vendasPorDia).sort((a, b) =>
+    new Date(a.split('/').reverse().join('-')) - new Date(b.split('/').reverse().join('-'))
+  );
+
+  if (dias.length === 0) {
+    dash.getRange('A3').setValue('Nenhuma venda no mês atual');
+  } else {
+    dash.getRange(2, 1).setValue('Data');
+    dash.getRange(2, 2).setValue('Total');
+    for (let i = 0; i < dias.length; i++) {
+      dash.getRange(i + 3, 1).setValue(dias[i]);
+      dash.getRange(i + 3, 2).setValue(vendasPorDia[dias[i]]).setNumberFormat('R$ #,##0.00');
+    }
+  }
+
+  dash.getCharts().forEach(c => dash.removeChart(c));
+
+  if (dias.length > 0) {
+    const chartBar = dash.newChart()
+      .asColumnChart()
+      .addRange(dash.getRange(2, 1, dias.length + 1, 2))
+      .setPosition(6, 1, 0, 0)
+      .setOption('title', 'Vendas do Mês por Dia')
+      .setOption('legend', { position: 'none' })
+      .setOption('hAxis', { title: 'Data da Venda' })
+      .setOption('vAxis', { title: 'Total do Dia', format: 'currency' })
+      .build();
+    dash.insertChart(chartBar);
+  }
+
+  dash.getRange(2, 4).setValue('Categoria');
+  dash.getRange(2, 5).setValue('Valor');
+  dash.getRange(3, 4).setValue('Preço de Custo');
+  dash.getRange(3, 5).setValue(totalCusto).setNumberFormat('R$ #,##0.00');
+  dash.getRange(4, 4).setValue('Valor Vendido');
+  dash.getRange(4, 5).setValue(totalVenda).setNumberFormat('R$ #,##0.00');
+  dash.getRange(5, 4).setValue('Lucro');
+  dash.getRange(5, 5).setValue(totalVenda - totalCusto).setNumberFormat('R$ #,##0.00');
+
+  const chartPie = dash.newChart()
+    .asPieChart()
+    .addRange(dash.getRange(2, 4, 4, 2))
+    .setPosition(6, 6, 0, 0)
+    .setOption('title', 'Comparativo: Custo x Venda x Lucro')
+    .setOption('pieHole', 0.3)
+    .build();
+  dash.insertChart(chartPie);
+
+  dash.getRange(2, 8).setValue("Forma de Pagamento");
+  dash.getRange(2, 9).setValue("Total no Mês");
+
+  const formas = Object.keys(formaPagamentoMes);
+  for (let i = 0; i < formas.length; i++) {
+    dash.getRange(i + 3, 8).setValue(formas[i]);
+    dash.getRange(i + 3, 9).setValue(formaPagamentoMes[formas[i]]).setNumberFormat('R$ #,##0.00');
+  }
+
+  const chartPagto = dash.newChart()
+    .asBarChart()
+    .addRange(dash.getRange(2, 8, formas.length + 1, 2))
+    .setPosition(25, 1, 0, 0)
+    .setOption('title', 'Formas de Pagamento - Mês Atual')
+    .setOption('legend', { position: 'none' })
+    .setOption('hAxis', { format: 'currency' })
+    .build();
+
+  dash.insertChart(chartPagto);
+}
+
+
+function setupPlanilha() {
+  const ss = SpreadsheetApp.getActive();
+  const produtos = ss.getSheetByName(NOME_ABA_PRODUTOS);
+  if (!produtos) throw new Error('Aba "Produtos" não encontrada.');
+  const ultimaLinhaProdutos = produtos.getLastRow();
+  recomputeEstoqueAll();
+
+  const rules = produtos.getConditionalFormatRules();
+  const newRule = SpreadsheetApp.newConditionalFormatRule()
+    .whenNumberLessThan(LIMITE_ESTOQUE_BAIXO)
+    .setBackground('#F8D7DA')
+    .setRanges([produtos.getRange('H2:H' + ultimaLinhaProdutos)])
+    .build();
+  rules.push(newRule);
+  produtos.setConditionalFormatRules(rules);
+  aplicarBordasProdutos();
+
+  const vendas = ss.getSheetByName(NOME_ABA_VENDAS);
+  if (vendas) {
+    const ultimaLinhaVendas = vendas.getMaxRows();
+    // Validação de dados na coluna J (Status de Pagamento)
+    const regraValidacao = SpreadsheetApp.newDataValidation()
+      .requireValueInList(["Pago", "Não Pago"], true)
+      .setAllowInvalid(false)
+      .build();
+    vendas.getRange("J2:J" + ultimaLinhaVendas).setDataValidation(regraValidacao);
+
+    const regras = vendas.getConditionalFormatRules();
+    const regraPago = SpreadsheetApp.newConditionalFormatRule()
+      .whenTextEqualTo("Pago")
+      .setBackground("#C6EFCE")
+      .setFontColor("#006100")
+      .setRanges([vendas.getRange("J2:J" + ultimaLinhaVendas)])
+      .build();
+    const regraNaoPago = SpreadsheetApp.newConditionalFormatRule()
+      .whenTextEqualTo("Não Pago")
+      .setBackground("#F8D7DA")
+      .setFontColor("#8B0000")
+      .setRanges([vendas.getRange("J2:J" + ultimaLinhaVendas)])
+      .build();
+    regras.push(regraPago);
+    regras.push(regraNaoPago);
+    vendas.setConditionalFormatRules(regras);
+  }
+  formatarPrecoProdutos();
+  atualizarDashboard();
+}
